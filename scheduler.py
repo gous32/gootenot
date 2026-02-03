@@ -1,6 +1,6 @@
 """Scheduling and polling logic for calendar notifications."""
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -90,19 +90,15 @@ class NotificationScheduler:
         last_poll = self.db.get_last_poll_time(chat_id)
         current_time = datetime.utcnow()
 
-        # First poll: get upcoming events and silently record them (no notifications)
-        is_first_poll = last_poll is None
-        if is_first_poll:
-            events = calendar.get_upcoming_events()
-            logger.info(f"First poll for user {chat_id}: {len(events)} upcoming events (recording without notifications)")
-        else:
-            # Get events changed since last poll
-            events = calendar.get_changed_events(updated_min=last_poll)
-            logger.debug(f"Poll for user {chat_id}: {len(events)} changed events")
+        # Get upcoming events
+        events = calendar.get_upcoming_events()
+        logger.info(f"Poll for user {chat_id}: {len(events)} upcoming events")
 
         # Process each event
         for event in events:
-            await self.process_event(chat_id, event, calendar, silent=is_first_poll)
+            event_summary = event.get('summary', 'No title')
+            logger.debug(f"Processing event: {event_summary}")
+            await self.process_event(chat_id, event, calendar)
 
         # Update last poll time
         self.db.update_last_poll_time(chat_id, current_time)
@@ -112,14 +108,13 @@ class NotificationScheduler:
         if new_creds != creds_json:
             self.db.save_user_credentials(chat_id, new_creds)
 
-    async def process_event(self, chat_id: int, event: Dict, calendar: CalendarService, silent: bool = False):
+    async def process_event(self, chat_id: int, event: Dict, calendar: CalendarService):
         """Process a single event and send appropriate notifications.
 
         Args:
             chat_id: User's Telegram chat ID
             event: Calendar event dictionary
             calendar: CalendarService instance
-            silent: If True, only mark events as notified without sending messages (for first poll)
         """
         event_id = event['id']
         event_updated = event.get('updated', '')
@@ -129,31 +124,29 @@ class NotificationScheduler:
         if event.get('status') == 'cancelled':
             return
 
+        await self.check_reminders(chat_id, event, calendar_id, event_updated)
+
         # Check if event was created or modified
         if not self.db.has_notification_sent(chat_id, event_id, 'created'):
             # New event
-            if not silent:
-                await self.send_notification(
-                    chat_id,
-                    f"🆕 *New Event*\n\n{format_event_message(event)}"
-                )
+            await self.send_notification(
+                chat_id,
+                f"🆕 *New Event*\n\n{format_event_message(event)}"
+            )
             self.db.mark_notification_sent(
                 chat_id, event_id, calendar_id, event_updated, 'created'
             )
         elif not self.db.has_notification_sent(chat_id, event_id, f'modified_{event_updated}'):
-            # Modified event
-            if not silent:
-                await self.send_notification(
-                    chat_id,
-                    f"✏️ *Event Updated*\n\n{format_event_message(event)}"
-                )
+            # Modified event - clear old reminder marks so new reminders can be sent
+            self.db.clear_event_reminder_notifications(chat_id, event_id)
+
+            await self.send_notification(
+                chat_id,
+                f"✏️ *Event Updated*\n\n{format_event_message(event)}"
+            )
             self.db.mark_notification_sent(
                 chat_id, event_id, calendar_id, event_updated, f'modified_{event_updated}'
             )
-
-        # Check for upcoming reminder notifications (skip on first poll)
-        if not silent:
-            await self.check_reminders(chat_id, event, calendar_id, event_updated)
 
     async def check_reminders(
         self,
@@ -164,37 +157,71 @@ class NotificationScheduler:
     ):
         """Check if reminder notifications should be sent for an event."""
         start = event.get('start', {})
+        event_id = event.get('id')
+        event_summary = event.get('summary', 'No title')
 
         # Skip all-day events for reminders
         if 'date' in start:
+            logger.debug(f"Skipping all-day event: {event_summary}")
             return
 
         try:
-            start_dt = datetime.fromisoformat(start.get('dateTime', '').replace('Z', '+00:00'))
+            start_datetime_str = start.get('dateTime', '')
+            start_dt = datetime.fromisoformat(start_datetime_str.replace('Z', '+00:00'))
         except ValueError:
-            logger.warning(f"Invalid datetime format for event {event['id']}")
+            logger.warning(f"Invalid datetime format for event {event_id}")
             return
 
-        now = datetime.utcnow().replace(tzinfo=start_dt.tzinfo)
+        # Get current time in UTC (timezone-aware) for proper comparison
+        now = datetime.now(timezone.utc)
         time_until = start_dt - now
+        time_until_minutes = time_until.total_seconds() / 60
+
+        logger.info(
+            f"Checking reminders for '{event_summary}' | "
+            f"Event time: {start_datetime_str} | "
+            f"Now: {now.isoformat()} | "
+            f"Starts in: {time_until_minutes:.1f} min"
+        )
 
         # Get user's reminder preferences
         reminder_times = self.db.get_reminder_times(chat_id)
+        logger.debug(f"User reminder times: {reminder_times} minutes")
 
         for minutes in reminder_times:
             reminder_window = timedelta(minutes=minutes)
             notification_type = f'reminder_{minutes}'
+            poll_buffer = timedelta(minutes=config.POLL_INTERVAL_SECONDS / 60)
 
-            # Check if we're within the reminder window
-            if timedelta(0) <= time_until <= reminder_window + timedelta(minutes=config.POLL_INTERVAL_SECONDS / 60):
-                if not self.db.has_notification_sent(chat_id, event['id'], notification_type):
+            lower_bound = (reminder_window - poll_buffer).total_seconds() / 60
+            upper_bound = (reminder_window + poll_buffer).total_seconds() / 60
+
+            in_window = reminder_window - poll_buffer <= time_until <= reminder_window + poll_buffer
+            already_sent = self.db.has_notification_sent(chat_id, event_id, notification_type)
+
+            logger.debug(
+                f"  Reminder {minutes}min: time_until={time_until_minutes:.1f}min, "
+                f"window=[{lower_bound:.1f}, {upper_bound:.1f}], "
+                f"in_window={in_window}, already_sent={already_sent}"
+            )
+
+            # Check if we're near the reminder time (within one poll interval)
+            if in_window:
+                if not already_sent:
+                    logger.info(f"🔔 Sending {minutes}min reminder for '{event_summary}'")
                     await self.send_notification(
                         chat_id,
                         f"⏰ *Reminder: Event in {minutes} minutes*\n\n{format_event_message(event)}"
                     )
                     self.db.mark_notification_sent(
-                        chat_id, event['id'], calendar_id, event_updated, notification_type
+                        chat_id, event_id, calendar_id, event_updated, notification_type
                     )
+                else:
+                    logger.debug(f"  Reminder {minutes}min already sent, skipping")
+
+        logger.info(
+            f"Checking reminders for '{event_summary}' done"
+        )
 
     async def send_daily_summaries(self):
         """Send daily summary to all users with summaries enabled."""

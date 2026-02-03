@@ -177,6 +177,18 @@ class Database:
             )
             conn.commit()
 
+    def clear_event_reminder_notifications(self, chat_id: int, event_id: str):
+        """Clear all reminder notification marks for an event (keep 'created' and 'modified' marks)."""
+        with self.get_connection() as conn:
+            conn.execute(
+                """DELETE FROM notified_events
+                   WHERE chat_id = ? AND event_id = ?
+                   AND notification_type LIKE 'reminder_%'""",
+                (chat_id, event_id)
+            )
+            conn.commit()
+            logger.info(f"Cleared reminder notifications for event {event_id}")
+
     def cleanup_old_notifications(self, days: int = 30):
         """Remove old notification records."""
         with self.get_connection() as conn:

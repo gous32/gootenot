@@ -1,7 +1,7 @@
 """Google Calendar API integration."""
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 
@@ -185,12 +185,40 @@ def format_event_summary(event: Dict[str, Any]) -> str:
 
     # Handle all-day events
     if 'date' in start:
-        start_str = start['date']
         time_info = "All day"
+        message = f"📅 *{summary}*\n🕐 {time_info}"
     else:
         start_dt = datetime.fromisoformat(start.get('dateTime', '').replace('Z', '+00:00'))
         end_dt = datetime.fromisoformat(end.get('dateTime', '').replace('Z', '+00:00'))
         time_info = f"{start_dt.strftime('%H:%M')} - {end_dt.strftime('%H:%M')}"
-        start_str = start_dt.strftime('%Y-%m-%d')
 
-    return f"📅 *{summary}*\n🕐 {time_info}\n📆 {start_str}"
+        # Calculate time remaining
+        now = datetime.now(timezone.utc)
+        time_until = start_dt - now
+        time_since_start = now - start_dt
+        time_since_end = now - end_dt
+
+        # Format time remaining/elapsed
+        if time_until.total_seconds() > 0:
+            # Event hasn't started yet
+            hours = int(time_until.total_seconds() // 3600)
+            minutes = int((time_until.total_seconds() % 3600) // 60)
+            if hours > 0:
+                time_status = f"⏳ Starts in {hours}h {minutes}min"
+            else:
+                time_status = f"⏳ Starts in {minutes}min"
+        elif time_since_end.total_seconds() < 0:
+            # Event is happening now
+            time_status = "▶️ Happening now"
+        else:
+            # Event has ended
+            hours = int(time_since_end.total_seconds() // 3600)
+            minutes = int((time_since_end.total_seconds() % 3600) // 60)
+            if hours > 0:
+                time_status = f"✅ Ended {hours}h {minutes}min ago"
+            else:
+                time_status = f"✅ Ended {minutes}min ago"
+
+        message = f"📅 *{summary}*\n🕐 {time_info}\n{time_status}"
+
+    return message
