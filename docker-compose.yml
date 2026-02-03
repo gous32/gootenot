@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  calendar-bot:
+    build: .
+    container_name: calendar-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    environment:
+      - DATA_DIR=/app/data
