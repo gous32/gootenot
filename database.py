@@ -187,3 +187,24 @@ class Database:
             )
             conn.commit()
             logger.info(f"Cleaned up notifications older than {days} days")
+
+    def clear_user_data(self, chat_id: int) -> bool:
+        """Clear all data for a user (credentials, notifications, settings)."""
+        try:
+            with self.get_connection() as conn:
+                # Delete notification history
+                conn.execute(
+                    "DELETE FROM notified_events WHERE chat_id = ?",
+                    (chat_id,)
+                )
+                # Delete user record (includes credentials and settings)
+                conn.execute(
+                    "DELETE FROM users WHERE chat_id = ?",
+                    (chat_id,)
+                )
+                conn.commit()
+                logger.info(f"Cleared all data for user {chat_id}")
+                return True
+        except Exception as e:
+            logger.error(f"Error clearing user data for {chat_id}: {e}")
+            return False

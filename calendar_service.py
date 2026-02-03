@@ -175,3 +175,22 @@ def format_event_message(event: Dict[str, Any]) -> str:
         message += f"\n{desc}\n"
 
     return message
+
+
+def format_event_summary(event: Dict[str, Any]) -> str:
+    """Format an event for summary view (name, date, time only)."""
+    summary = event.get('summary', 'No title')
+    start = event.get('start', {})
+    end = event.get('end', {})
+
+    # Handle all-day events
+    if 'date' in start:
+        start_str = start['date']
+        time_info = "All day"
+    else:
+        start_dt = datetime.fromisoformat(start.get('dateTime', '').replace('Z', '+00:00'))
+        end_dt = datetime.fromisoformat(end.get('dateTime', '').replace('Z', '+00:00'))
+        time_info = f"{start_dt.strftime('%H:%M')} - {end_dt.strftime('%H:%M')}"
+        start_str = start_dt.strftime('%Y-%m-%d')
+
+    return f"📅 *{summary}*\n🕐 {time_info}\n📆 {start_str}"

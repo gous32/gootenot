@@ -2,7 +2,7 @@
 import logging
 from datetime import datetime
 
-from telegram import Update
+from telegram import Update, BotCommand
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -14,7 +14,7 @@ from telegram.ext import (
 
 import config
 from database import Database
-from calendar_service import CalendarService, format_event_message
+from calendar_service import CalendarService, format_event_message, format_event_summary
 from scheduler import NotificationScheduler
 
 # Configure logging
@@ -57,10 +57,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Store flow in context for later
         context.user_data['auth_flow'] = flow
 
+        # Escape special characters in URL for Markdown
+        escaped_url = auth_url.replace('_', r'\_').replace('*', r'\*').replace('[', r'\[').replace('`', r'\`')
+
         await update.message.reply_text(
             "🔐 *Google Calendar Authentication*\n\n"
             "To connect your Google Calendar:\n\n"
-            f"1. Visit this URL:\n{auth_url}\n\n"
+            f"1. Visit this URL:\n{escaped_url}\n\n"
             "2. Grant calendar access\n"
             "3. Copy the authorization code\n"
             "4. Send the code back to me\n\n"
@@ -154,7 +157,7 @@ async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             message = f"📅 *Today's Schedule* ({len(events)} events)\n\n"
             for event in events:
-                message += format_event_message(event) + "\n---\n"
+                message += format_event_summary(event) + "\n\n"
 
             # Telegram message limit is 4096 chars
             if len(message) > 4000:
@@ -183,7 +186,7 @@ async def reminders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Current reminders: {', '.join(str(m) + ' min' for m in current_times)} before events\n\n"
         f"To change, send comma-separated minutes:\n"
         f"Example: `15,60,1440` for 15min, 1hr, 1 day before\n\n"
-        f"Or use /reminders_default to reset to default (15min, 1hr)",
+        f"Or use /reminders\\_default to reset to default (15min, 1hr)",
         parse_mode='Markdown'
     )
 
@@ -198,6 +201,27 @@ async def reminders_default_command(update: Update, context: ContextTypes.DEFAUL
     )
 
 
+async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Clear all user data from the database."""
+    chat_id = update.effective_chat.id
+
+    success = db.clear_user_data(chat_id)
+
+    if success:
+        await update.message.reply_text(
+            "✅ *All your data has been cleared*\n\n"
+            "• Google Calendar credentials removed\n"
+            "• Notification history deleted\n"
+            "• Settings reset\n\n"
+            "Use /start to reconnect your calendar.",
+            parse_mode='Markdown'
+        )
+    else:
+        await update.message.reply_text(
+            "❌ Error clearing data. Please try again or contact support."
+        )
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show help message."""
     help_text = """
@@ -206,7 +230,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /start - Connect your Google Calendar
 /summary - Show today's events
 /reminders - Configure reminder times
-/reminders_default - Reset reminders to default
+/reminders\\_default - Reset reminders to default
+/clear - Clear all your data
 /help - Show this help message
 
 *Automatic Notifications:*
@@ -249,6 +274,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
 
+async def setup_bot_commands(application: Application):
+    """Set up bot command hints."""
+    commands = [
+        BotCommand("start", "Connect your Google Calendar"),
+        BotCommand("summary", "Show today's events"),
+        BotCommand("reminders", "Configure reminder times"),
+        BotCommand("reminders_default", "Reset reminders to default"),
+        BotCommand("clear", "Clear all your data"),
+        BotCommand("help", "Show help message"),
+    ]
+    await application.bot.set_my_commands(commands)
+    logger.info("Bot commands set up")
+
+
 def main():
     """Start the bot."""
     global scheduler
@@ -276,8 +315,12 @@ def main():
     application.add_handler(CommandHandler('summary', summary_command))
     application.add_handler(CommandHandler('reminders', reminders_command))
     application.add_handler(CommandHandler('reminders_default', reminders_default_command))
+    application.add_handler(CommandHandler('clear', clear_command))
     application.add_handler(CommandHandler('help', help_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Set up bot commands on startup
+    application.post_init = setup_bot_commands
 
     # Start bot
     logger.info("Bot is running...")

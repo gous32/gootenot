@@ -1,7 +1,7 @@
 """Scheduling and polling logic for calendar notifications."""
 import logging
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Dict
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -90,10 +90,11 @@ class NotificationScheduler:
         last_poll = self.db.get_last_poll_time(chat_id)
         current_time = datetime.utcnow()
 
-        # First poll: get upcoming events instead of changed events
-        if last_poll is None:
+        # First poll: get upcoming events and silently record them (no notifications)
+        is_first_poll = last_poll is None
+        if is_first_poll:
             events = calendar.get_upcoming_events()
-            logger.info(f"First poll for user {chat_id}: {len(events)} upcoming events")
+            logger.info(f"First poll for user {chat_id}: {len(events)} upcoming events (recording without notifications)")
         else:
             # Get events changed since last poll
             events = calendar.get_changed_events(updated_min=last_poll)
@@ -101,7 +102,7 @@ class NotificationScheduler:
 
         # Process each event
         for event in events:
-            await self.process_event(chat_id, event, calendar)
+            await self.process_event(chat_id, event, calendar, silent=is_first_poll)
 
         # Update last poll time
         self.db.update_last_poll_time(chat_id, current_time)
@@ -111,8 +112,15 @@ class NotificationScheduler:
         if new_creds != creds_json:
             self.db.save_user_credentials(chat_id, new_creds)
 
-    async def process_event(self, chat_id: int, event: Dict, calendar: CalendarService):
-        """Process a single event and send appropriate notifications."""
+    async def process_event(self, chat_id: int, event: Dict, calendar: CalendarService, silent: bool = False):
+        """Process a single event and send appropriate notifications.
+
+        Args:
+            chat_id: User's Telegram chat ID
+            event: Calendar event dictionary
+            calendar: CalendarService instance
+            silent: If True, only mark events as notified without sending messages (for first poll)
+        """
         event_id = event['id']
         event_updated = event.get('updated', '')
         calendar_id = 'primary'
@@ -124,25 +132,28 @@ class NotificationScheduler:
         # Check if event was created or modified
         if not self.db.has_notification_sent(chat_id, event_id, 'created'):
             # New event
-            await self.send_notification(
-                chat_id,
-                f"🆕 *New Event*\n\n{format_event_message(event)}"
-            )
+            if not silent:
+                await self.send_notification(
+                    chat_id,
+                    f"🆕 *New Event*\n\n{format_event_message(event)}"
+                )
             self.db.mark_notification_sent(
                 chat_id, event_id, calendar_id, event_updated, 'created'
             )
         elif not self.db.has_notification_sent(chat_id, event_id, f'modified_{event_updated}'):
             # Modified event
-            await self.send_notification(
-                chat_id,
-                f"✏️ *Event Updated*\n\n{format_event_message(event)}"
-            )
+            if not silent:
+                await self.send_notification(
+                    chat_id,
+                    f"✏️ *Event Updated*\n\n{format_event_message(event)}"
+                )
             self.db.mark_notification_sent(
                 chat_id, event_id, calendar_id, event_updated, f'modified_{event_updated}'
             )
 
-        # Check for upcoming reminder notifications
-        await self.check_reminders(chat_id, event, calendar_id, event_updated)
+        # Check for upcoming reminder notifications (skip on first poll)
+        if not silent:
+            await self.check_reminders(chat_id, event, calendar_id, event_updated)
 
     async def check_reminders(
         self,
